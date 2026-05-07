@@ -2,15 +2,15 @@
 """
 ccswitch - Claude Code account switcher
 Usage:
-  ccswitch list                          List saved profiles
-  ccswitch save <name>                   Save active account as a named profile
-  ccswitch use <name>                    Switch to a saved profile instantly
-  ccswitch add <name>                    Add a new account (opens browser login)
-  ccswitch remove <name>                 Remove a saved profile
-  ccswitch status                        Show active account and all profiles
-  ccswitch helper install <ext-id>       Install Chrome usage helper
-  ccswitch helper uninstall              Remove Chrome usage helper
-  ccswitch doctor                        Check tool health
+  ccswitch list                List saved profiles
+  ccswitch save <name>         Save active account as a named profile
+  ccswitch use <name>          Switch to a saved profile instantly
+  ccswitch add <name>          Add a new account (opens browser login)
+  ccswitch remove <name>       Remove a saved profile
+  ccswitch status              Show active account and all profiles
+  ccswitch doctor              Check tool health
+
+Usage display requires Chrome with claude.ai open and logged in.
 """
 
 import sys
@@ -20,13 +20,15 @@ import subprocess
 import os
 import re
 import base64
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 ACTIVE_SERVICE   = "Claude Code-credentials"
 PROFILES_SERVICE = "ccswitch-profiles"
 INDEX_FILE       = os.path.expanduser("~/.claude/ccswitch-index.json")
-VERSION          = "1.5.0"
+VERSION          = "1.6.0"
+WELCOME_FLAG     = Path.home() / ".claude" / "ccswitch-welcomed"
 
 HELPER_SOCK      = Path.home() / ".claude" / "ccswitch-helper.sock"
 HELPER_DIR       = Path.home() / ".local" / "share" / "ccswitch"
@@ -117,6 +119,46 @@ if __name__ == "__main__":
 '''
 
 
+# ── Banner ───────────────────────────────────────────────────────────────────
+
+def _banner():
+    """Print welcome banner. Big on first run, small one-liner after that.
+    Silenced by: CCSWITCH_BANNER=0, NO_COLOR, CI, or non-TTY stdout."""
+    if (os.environ.get("CCSWITCH_BANNER") == "0"
+            or os.environ.get("NO_COLOR")
+            or os.environ.get("CI")
+            or not sys.stdout.isatty()):
+        return
+
+    OR = "\x1b[38;5;209m"   # orange
+    DM = "\x1b[2m"           # dim
+    BD = "\x1b[1m"           # bold
+    RS = "\x1b[0m"           # reset
+
+    if not WELCOME_FLAG.exists():
+        art = [
+            "██████╗ ██████╗ ███████╗██╗    ██╗██╗████████╗ ██████╗██╗  ██╗",
+            "██╔════╝██╔════╝██╔════╝██║    ██║██║╚══██╔══╝██╔════╝██║  ██║",
+            "██║     ██║     ███████╗██║ █╗ ██║██║   ██║   ██║     ███████║",
+            "██║     ██║     ╚════██║██║███╗██║██║   ██║   ██║     ██╔══██║",
+            "╚██████╗╚██████╗███████║╚███╔███╔╝██║   ██║   ╚██████╗██║  ██║",
+            " ╚═════╝ ╚═════╝╚══════╝ ╚══╝╚══╝ ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝",
+        ]
+        print()
+        for line in art:
+            print(f"  {OR}{BD}{line}{RS}")
+        print(f"\n  {DM}Claude Code account switcher · by recepzgrmh{RS}")
+        print(f"\n  {DM}If ccswitch saves you some logins, a star means a lot:{RS}")
+        print(f"  {DM}→ https://github.com/recepzgrmh/ccswitch{RS}\n")
+        try:
+            WELCOME_FLAG.parent.mkdir(parents=True, exist_ok=True)
+            WELCOME_FLAG.touch()
+        except Exception:
+            pass
+    else:
+        print(f"  {DM}ccswitch {VERSION}{RS}")
+
+
 # ── JWT helpers ───────────────────────────────────────────────────────────────
 
 def decode_jwt_email(token):
@@ -192,10 +234,102 @@ def save_index(index):
         json.dump(index, f, indent=2)
 
 
-# ── Usage via Chrome helper extension ────────────────────────────────────────
+# ── Usage via AppleScript (runs fetch() inside Chrome's claude.ai tab) ───────
+
+def _fetch_usage_via_applescript(org_id="", timeout=12):
+    """Execute fetch() in Chrome's open claude.ai tab. No extension needed. Returns dict or None."""
+    # Require Chrome to be running
+    r = subprocess.run(["pgrep", "-x", "Google Chrome"], capture_output=True)
+    if r.returncode != 0:
+        return None
+
+    # Build JS that fetches usage; discovers org_id first if not supplied
+    if org_id:
+        js_fetch = (
+            "(function(){"
+            "fetch('https://claude.ai/api/organizations/" + org_id + "/usage',"
+            "{credentials:'include',headers:{'Accept':'application/json'}})"
+            ".then(function(r){return r.json()})"
+            ".then(function(d){window.__ccswitch__=JSON.stringify({ok:true,usage:d,org_id:'" + org_id + "'})})"
+            ".catch(function(e){window.__ccswitch__=JSON.stringify({ok:false,error:String(e.message)})});"
+            "return 'started';})()"
+        )
+    else:
+        js_fetch = (
+            "(function(){"
+            "fetch('https://claude.ai/api/account',"
+            "{credentials:'include',headers:{'Accept':'application/json'}})"
+            ".then(function(r){return r.json()})"
+            ".then(function(d){"
+            "var oid=d&&d.memberships&&d.memberships[0]&&d.memberships[0].organization&&d.memberships[0].organization.id;"
+            "if(!oid){window.__ccswitch__=JSON.stringify({ok:false,error:'no_org_id'});return;}"
+            "return fetch('https://claude.ai/api/organizations/'+oid+'/usage',"
+            "{credentials:'include',headers:{'Accept':'application/json'}})"
+            ".then(function(r){return r.json()})"
+            ".then(function(u){window.__ccswitch__=JSON.stringify({ok:true,usage:u,org_id:oid});});})"
+            ".catch(function(e){window.__ccswitch__=JSON.stringify({ok:false,error:String(e.message)})});"
+            "return 'started';})()"
+        )
+
+    js_read  = "typeof window.__ccswitch__!='undefined'?window.__ccswitch__:'__pending__'"
+    js_clear = "delete window.__ccswitch__; 'ok'"
+
+    def run_js(js):
+        js_escaped = js.replace("\\", "\\\\").replace('"', '\\"')
+        script = (
+            'tell application "Google Chrome"\n'
+            '  set t to missing value\n'
+            '  repeat with w in every window\n'
+            '    repeat with tt in every tab of w\n'
+            '      if URL of tt starts with "https://claude.ai" then\n'
+            '        set t to tt\n'
+            '        exit repeat\n'
+            '      end if\n'
+            '    end repeat\n'
+            '    if t is not missing value then exit repeat\n'
+            '  end repeat\n'
+            '  if t is missing value then return "__no_tab__"\n'
+            '  return execute t javascript "' + js_escaped + '"\n'
+            'end tell'
+        )
+        return subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=timeout
+        )
+
+    # Inject the fetch call
+    r = run_js(js_fetch)
+    if r.returncode != 0:
+        if "Apple Events" in r.stderr or "AppleScript" in r.stderr:
+            return {"ok": False, "error": "js_apple_events_disabled"}
+        return None
+    if "__no_tab__" in r.stdout:
+        return None
+
+    # Poll for result (up to ~6 seconds)
+    deadline = time.time() + 6
+    val = "__pending__"
+    while time.time() < deadline:
+        time.sleep(0.7)
+        r = run_js(js_read)
+        if r.returncode != 0:
+            return None
+        val = r.stdout.strip()
+        if val and val != "__pending__":
+            break
+
+    run_js(js_clear)
+
+    if not val or val == "__pending__":
+        return None
+    try:
+        return json.loads(val)
+    except Exception:
+        return None
+
 
 def _fetch_usage_via_extension(org_id="", timeout=5):
-    """Send usage request to the Chrome helper bridge socket. Returns dict or None."""
+    """Try the optional Chrome helper socket (fast path if extension is installed)."""
     if not HELPER_SOCK.exists():
         return None
     try:
@@ -213,6 +347,14 @@ def _fetch_usage_via_extension(org_id="", timeout=5):
         return json.loads(b"".join(chunks).decode())
     except Exception:
         return None
+
+
+def _fetch_usage(org_id=""):
+    """Fetch Claude usage. Tries extension socket first (if installed), then AppleScript."""
+    result = _fetch_usage_via_extension(org_id)
+    if result and result.get("ok"):
+        return result
+    return _fetch_usage_via_applescript(org_id)
 
 
 # ── Usage display ─────────────────────────────────────────────────────────────
@@ -239,10 +381,12 @@ def _bar(util, width=10):
 def print_usage_for_profile(profile_name):
     index  = load_index()
     org_id = index.get(profile_name, {}).get("org_id", "")
-    result = _fetch_usage_via_extension(org_id)
+    result = _fetch_usage(org_id)
     if not result or not result.get("ok"):
+        if result and result.get("error") == "js_apple_events_disabled":
+            print("  usage    : Chrome > View > Developer > Allow JavaScript from Apple Events  (one-time setup)")
         return
-    # Cache org_id returned by extension for faster future calls
+    # Cache org_id for faster future calls
     returned_org_id = result.get("org_id")
     if returned_org_id and not org_id and profile_name in index:
         index[profile_name]["org_id"] = returned_org_id
@@ -609,26 +753,53 @@ def cmd_doctor():
     index = load_index()
     print(f"  profiles   : {len(index)} saved")
 
-    # helper
-    manifest_path = NATIVE_HOSTS_DIR / f"{NATIVE_HOST_NAME}.json"
-    bridge_path   = HELPER_DIR / "ccswitch_chrome_bridge.py"
-    sock_exists   = HELPER_SOCK.exists()
+    # Chrome running?
+    r_chrome = subprocess.run(["pgrep", "-x", "Google Chrome"], capture_output=True)
+    chrome_ok = r_chrome.returncode == 0
+    print(f"  Chrome     : {'✓ running' if chrome_ok else '✗ not running  (open Chrome for usage display)'}")
 
-    print(f"  manifest   : {'✓' if manifest_path.exists() else '✗ run: ccswitch helper install <ext-id>'}")
-    print(f"  bridge     : {'✓' if bridge_path.exists() else '✗'}")
-    print(f"  socket     : {'✓ bridge is running' if sock_exists else '✗ open Chrome with ccswitch extension'}")
+    # claude.ai tab open?
+    if chrome_ok:
+        script = (
+            'tell application "Google Chrome"\n'
+            '  set t to missing value\n'
+            '  repeat with w in every window\n'
+            '    repeat with tt in every tab of w\n'
+            '      if URL of tt starts with "https://claude.ai" then\n'
+            '        set t to tt\n'
+            '        exit repeat\n'
+            '      end if\n'
+            '    end repeat\n'
+            '    if t is not missing value then exit repeat\n'
+            '  end repeat\n'
+            '  if t is missing value then return "__no_tab__"\n'
+            '  return "ok"\n'
+            'end tell'
+        )
+        r_tab = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=6)
+        tab_ok = r_tab.returncode == 0 and "__no_tab__" not in r_tab.stdout
+        print(f"  claude.ai  : {'✓ tab open' if tab_ok else '✗ no tab  (open https://claude.ai in Chrome)'}")
 
-    if sock_exists:
-        test = _fetch_usage_via_extension(timeout=3)
-        if test and test.get("ok"):
-            u5  = test.get("usage", {}).get("five_hour", {}).get("utilization", "?")
-            u7  = test.get("usage", {}).get("seven_day", {}).get("utilization", "?")
-            print(f"  usage API  : ✓ 5h={u5}%  7d={u7}%")
-        else:
-            err = (test or {}).get("error", "no response")
-            print(f"  usage API  : ✗ {err}")
-            if "not_logged_into_claude_ai" in err:
-                print("               → open https://claude.ai in Chrome and log in")
+        if tab_ok:
+            print("  usage API  : checking…", end="", flush=True)
+            test = _fetch_usage_via_applescript(timeout=12)
+            if test and test.get("ok"):
+                u5  = test.get("usage", {}).get("five_hour", {}).get("utilization", "?")
+                u7  = test.get("usage", {}).get("seven_day", {}).get("utilization", "?")
+                print(f"\r  usage API  : ✓ 5h={u5}%  7d={u7}%   ")
+            elif (test or {}).get("error") == "js_apple_events_disabled":
+                print(f"\r  usage API  : ✗ Apple Events JS disabled")
+                print("               → Chrome menu bar: View > Developer > Allow JavaScript from Apple Events")
+            else:
+                err = (test or {}).get("error", "no response")
+                print(f"\r  usage API  : ✗ {err}")
+                if "not_logged_into" in err or test is None:
+                    print("               → make sure you're logged into claude.ai in Chrome")
+
+    # Optional extension socket
+    sock_ok = HELPER_SOCK.exists()
+    if sock_ok:
+        print(f"  ext socket : ✓ running (optional fast path)")
 
     print()
 
@@ -639,12 +810,15 @@ def main():
     args = sys.argv[1:]
 
     if not args or args[0] in ("-h", "--help", "help"):
+        _banner()
         print(__doc__)
         sys.exit(0)
 
     if args[0] in ("-v", "--version", "version"):
         print(f"ccswitch {VERSION}")
         sys.exit(0)
+
+    _banner()
 
     cmd  = args[0]
     rest = args[1:]
