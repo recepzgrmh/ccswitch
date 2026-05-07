@@ -364,7 +364,7 @@ def _fetch_usage(org_id=""):
             print()
             return result
         if ans == "y":
-            subprocess.run(["open", "-a", "Google Chrome"], capture_output=True)
+            subprocess.run(["open", "-a", "Google Chrome", "https://claude.ai"], capture_output=True)
             print()
             print("  In Chrome menu bar:")
             print("  View → Developer → Allow JavaScript from Apple Events")
