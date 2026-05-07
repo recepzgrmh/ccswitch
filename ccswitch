@@ -393,35 +393,37 @@ def _validate_session_key(session_key):
         return False
 
 def capture_session(profile_name, open_browser=False):
-    """Try to capture Chrome session. If open_browser=True, opens claude.ai first to refresh cookies."""
-    if open_browser and CHROME_ROOT.exists():
+    """Try to capture Chrome session. If open_browser=True, prompts user to log in to claude.ai."""
+    if not CHROME_ROOT.exists():
+        return
+
+    if open_browser:
         try:
-            print("  Opening claude.ai in Chrome to refresh session...")
             subprocess.Popen(["open", "-a", "Google Chrome", "https://claude.ai"])
-            time.sleep(5)
         except Exception:
             pass
-
-    for attempt in range(2):
+        print()
+        print("  For usage tracking, log into claude.ai in the Chrome tab that just opened.")
         try:
-            data = find_chrome_session_data()
-            sk = data.get("sessionKey", "")
-            if sk and _validate_session_key(sk):
-                save_session_data(profile_name, data)
-                org_note = f", org {data['orgId'][:8]}..." if data.get("orgId") else ""
-                print(f"  ✓ browser session captured from Chrome{org_note}")
-                return
-            elif attempt == 0 and open_browser:
-                # Session invalid on first try — wait a bit more and retry once
-                time.sleep(4)
-                continue
-            else:
-                # Save anyway so capture_session --refresh can retry later
-                if sk:
-                    save_session_data(profile_name, data)
-                return
-        except RuntimeError:
+            input("  Press Enter once you're logged in (or Ctrl+C to skip)... ")
+        except (KeyboardInterrupt, EOFError):
+            print()
             return
+
+    try:
+        data = find_chrome_session_data()
+        sk = data.get("sessionKey", "")
+        if sk and _validate_session_key(sk):
+            save_session_data(profile_name, data)
+            org_note = f", org {data['orgId'][:8]}..." if data.get("orgId") else ""
+            print(f"  ✓ browser session captured from Chrome{org_note}")
+        elif sk:
+            # Save even if invalid — user can retry with ccswitch save
+            save_session_data(profile_name, data)
+            if open_browser:
+                print(f"  ! session still invalid. Try: open claude.ai in Chrome, log in, then run 'ccswitch save {profile_name}'")
+    except RuntimeError:
+        pass
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
