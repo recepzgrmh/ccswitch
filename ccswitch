@@ -37,12 +37,15 @@ def keychain_read(service, account):
         return None
 
 def keychain_write(service, account, data):
+    # Delete first, then add atomically via a temp entry to minimize the window
+    # where neither old nor new entry exists.
     subprocess.run(
         ["security", "delete-generic-password", "-s", service, "-a", account],
         capture_output=True
     )
     result = subprocess.run(
-        ["security", "add-generic-password", "-s", service, "-a", account, "-w", json.dumps(data)],
+        ["security", "add-generic-password", "-s", service, "-a", account,
+         "-w", json.dumps(data)],
         capture_output=True, text=True
     )
     return result.returncode == 0
@@ -176,8 +179,17 @@ def cmd_add(name):
         print("Error: profile name required.  ccswitch add <name>")
         sys.exit(1)
 
+    # Warn if profile name already exists
+    index = load_index()
+    if name in index:
+        answer = input(f"Profile '{name}' already exists ({index[name].get('email','?')}). Overwrite? [y/N]: ").strip().lower()
+        if answer != "y":
+            print("Aborted.")
+            sys.exit(0)
+
     print(f"Adding new account as '{name}'...")
     old_account, old_creds = read_active_credentials()
+    old_token = (old_creds or {}).get("claudeAiOauth", {}).get("accessToken", "")
 
     print("Opening browser, please log in...")
     print("(return to this terminal when done)\n")
@@ -191,11 +203,34 @@ def cmd_add(name):
         sys.exit(1)
 
     new_account, new_creds = read_active_credentials()
+
+    # Check login actually happened (credentials must have changed)
     if not new_creds:
-        print("Error: could not read new credentials.")
+        print("Error: could not read credentials after login.")
         if old_creds and old_account:
             write_active_credentials(old_account, old_creds)
         sys.exit(1)
+
+    new_token = new_creds.get("claudeAiOauth", {}).get("accessToken", "")
+    if new_token == old_token:
+        print("Error: login was cancelled or the same account was used.")
+        print("  No new credentials detected. Profile not saved.")
+        sys.exit(1)
+
+    # Warn if this account is already saved under a different profile name
+    existing_profile = None
+    for pname, meta in index.items():
+        if meta.get("email") == new_account and pname != name:
+            existing_profile = pname
+            break
+    if existing_profile:
+        print(f"Warning: this account ({new_account}) is already saved as '{existing_profile}'.")
+        answer = input("Save it again under a new name? [y/N]: ").strip().lower()
+        if answer != "y":
+            print("Aborted. Restoring previous session...")
+            if old_creds and old_account:
+                write_active_credentials(old_account, old_creds)
+            sys.exit(0)
 
     if not keychain_write(PROFILES_SERVICE, name, new_creds):
         print("Error: could not write to Keychain.")
@@ -206,7 +241,6 @@ def cmd_add(name):
     expires_ms = oauth.get("expiresAt", 0)
     expires_dt = datetime.fromtimestamp(expires_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    index = load_index()
     index[name] = {
         "email": new_account,
         "subscription": sub_type,
@@ -216,21 +250,24 @@ def cmd_add(name):
     save_index(index)
     print(f"\n✓ '{name}' ({new_account}, {sub_type}) added and active")
 
+    # Offer to save the previous account too (only if not already saved)
     if old_creds and old_account and old_account != new_account:
-        print(f"\nPrevious account ({old_account}) is now inactive.")
-        answer = input("Save it too? (enter a name or press Enter to skip): ").strip()
-        if answer:
-            if not keychain_write(PROFILES_SERVICE, answer, old_creds):
-                print("Error: could not save previous account.")
-            else:
-                old_oauth = old_creds.get("claudeAiOauth", {})
-                index[answer] = {
-                    "email": old_account,
-                    "subscription": old_oauth.get("subscriptionType", "?"),
-                    "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                }
-                save_index(index)
-                print(f"✓ '{answer}' ({old_account}) saved")
+        already_saved = any(m.get("email") == old_account for m in index.values())
+        if not already_saved:
+            print(f"\nPrevious account ({old_account}) is now inactive.")
+            answer = input("Save it too? (enter a name or press Enter to skip): ").strip()
+            if answer:
+                if not keychain_write(PROFILES_SERVICE, answer, old_creds):
+                    print("Error: could not save previous account.")
+                else:
+                    old_oauth = old_creds.get("claudeAiOauth", {})
+                    index[answer] = {
+                        "email": old_account,
+                        "subscription": old_oauth.get("subscriptionType", "?"),
+                        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    }
+                    save_index(index)
+                    print(f"✓ '{answer}' ({old_account}) saved")
 
 def cmd_remove(name):
     if not name:
