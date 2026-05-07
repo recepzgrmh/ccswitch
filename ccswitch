@@ -16,12 +16,26 @@ import json
 import subprocess
 import os
 import re
+import base64
 from datetime import datetime, timezone
 
 ACTIVE_SERVICE = "Claude Code-credentials"
 PROFILES_SERVICE = "ccswitch-profiles"
 INDEX_FILE = os.path.expanduser("~/.claude/ccswitch-index.json")
-VERSION = "1.1.0"
+VERSION = "1.2.0"
+
+
+# ── JWT helpers ──────────────────────────────────────────────────────────────
+
+def decode_jwt_email(token):
+    """Decode JWT payload and extract email/sub without verifying signature."""
+    try:
+        payload = token.split('.')[1]
+        payload += '=' * (4 - len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return data.get('email') or data.get('sub') or None
+    except Exception:
+        return None
 
 
 # ── Keychain helpers ──────────────────────────────────────────────────────────
@@ -143,15 +157,17 @@ def cmd_save(name):
         print("Error: could not write to Keychain.")
         sys.exit(1)
 
+    display_email = decode_jwt_email(oauth.get("accessToken", "")) or account
     index = load_index()
     index[name] = {
-        "email": account,
+        "email": display_email,
+        "keychain_account": account,
         "subscription": sub_type,
         "expires_at": expires_dt,
         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
     save_index(index)
-    print(f"✓ saved as '{name}' ({account}, {sub_type})")
+    print(f"✓ saved as '{name}' ({display_email}, {sub_type})")
 
 def cmd_use(name):
     if not name:
@@ -170,7 +186,8 @@ def cmd_use(name):
         sys.exit(1)
 
     email = index[name].get("email", name)
-    if not write_active_credentials(email, creds):
+    keychain_account = index[name].get("keychain_account") or email
+    if not write_active_credentials(keychain_account, creds):
         print("Error: could not update active credentials.")
         sys.exit(1)
 
@@ -220,13 +237,14 @@ def cmd_add(name):
         sys.exit(1)
 
     # Warn if this account is already saved under a different profile name
+    new_display_email = decode_jwt_email(new_token) or new_account
     existing_profile = None
     for pname, meta in index.items():
-        if meta.get("email") == new_account and pname != name:
+        if meta.get("email") == new_display_email and pname != name:
             existing_profile = pname
             break
     if existing_profile:
-        print(f"Warning: this account ({new_account}) is already saved as '{existing_profile}'.")
+        print(f"Warning: this account ({new_display_email}) is already saved as '{existing_profile}'.")
         answer = input("Save it again under a new name? [y/N]: ").strip().lower()
         if answer != "y":
             print("Aborted. Restoring previous session...")
@@ -243,20 +261,23 @@ def cmd_add(name):
     expires_ms = oauth.get("expiresAt", 0)
     expires_dt = datetime.fromtimestamp(expires_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+    display_email = decode_jwt_email(oauth.get("accessToken", "")) or new_account
     index[name] = {
-        "email": new_account,
+        "email": display_email,
+        "keychain_account": new_account,
         "subscription": sub_type,
         "expires_at": expires_dt,
         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
     save_index(index)
-    print(f"\n✓ '{name}' ({new_account}, {sub_type}) added and active")
+    print(f"\n✓ '{name}' ({display_email}, {sub_type}) added and active")
 
     # Offer to save the previous account too (only if not already saved)
     if old_creds and old_account and old_account != new_account:
-        already_saved = any(m.get("email") == old_account for m in index.values())
+        old_display_email = decode_jwt_email(old_token) or old_account
+        already_saved = any(m.get("email") == old_display_email for m in index.values())
         if not already_saved:
-            print(f"\nPrevious account ({old_account}) is now inactive.")
+            print(f"\nPrevious account ({old_display_email}) is now inactive.")
             answer = input("Save it too? (enter a name or press Enter to skip): ").strip()
             if answer:
                 if not keychain_write(PROFILES_SERVICE, answer, old_creds):
@@ -264,12 +285,13 @@ def cmd_add(name):
                 else:
                     old_oauth = old_creds.get("claudeAiOauth", {})
                     index[answer] = {
-                        "email": old_account,
+                        "email": old_display_email,
+                        "keychain_account": old_account,
                         "subscription": old_oauth.get("subscriptionType", "?"),
                         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     }
                     save_index(index)
-                    print(f"✓ '{answer}' ({old_account}) saved")
+                    print(f"✓ '{answer}' ({old_display_email}) saved")
 
 def cmd_remove(name):
     if not name:
@@ -311,9 +333,11 @@ def cmd_status():
             matched_profile = pname
             break
 
+    display_email = decode_jwt_email(active_token) or account
+
     print()
     print("  ── Active session ──────────────────────────────")
-    print(f"  Account  : {account}")
+    print(f"  Account  : {display_email}")
     print(f"  Profile  : {matched_profile or '(not saved)'}")
     print(f"  Plan     : {sub_type} ({tier})")
     expiry_label = f"{expires_dt}  ⚠ EXPIRED" if expired else expires_dt
