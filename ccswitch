@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""
+ccswitch - Claude Code account switcher
+Usage:
+  ccswitch list              List saved profiles
+  ccswitch save <name>       Save active account as a named profile
+  ccswitch use <name>        Switch to a saved profile instantly
+  ccswitch add <name>        Add a new account (opens browser login)
+  ccswitch remove <name>     Remove a saved profile
+  ccswitch current           Show the active account
+"""
+
+import sys
+import json
+import subprocess
+import os
+import re
+from datetime import datetime, timezone
+
+ACTIVE_SERVICE = "Claude Code-credentials"
+PROFILES_SERVICE = "ccswitch-profiles"
+INDEX_FILE = os.path.expanduser("~/.claude/ccswitch-index.json")
+
+
+# ── Keychain helpers ──────────────────────────────────────────────────────────
+
+def keychain_read(service, account):
+    result = subprocess.run(
+        ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout.strip())
+    except json.JSONDecodeError:
+        return None
+
+def keychain_write(service, account, data):
+    subprocess.run(
+        ["security", "delete-generic-password", "-s", service, "-a", account],
+        capture_output=True
+    )
+    result = subprocess.run(
+        ["security", "add-generic-password", "-s", service, "-a", account, "-w", json.dumps(data)],
+        capture_output=True, text=True
+    )
+    return result.returncode == 0
+
+def keychain_delete(service, account):
+    result = subprocess.run(
+        ["security", "delete-generic-password", "-s", service, "-a", account],
+        capture_output=True
+    )
+    return result.returncode == 0
+
+def get_active_account():
+    """Find the keychain account name of the active credentials."""
+    result = subprocess.run(
+        ["security", "find-generic-password", "-s", ACTIVE_SERVICE],
+        capture_output=True, text=True
+    )
+    match = re.search(r'"acct"<blob>="([^"]+)"', result.stdout)
+    return match.group(1) if match else None
+
+def read_active_credentials():
+    account = get_active_account()
+    if not account:
+        return None, None
+    data = keychain_read(ACTIVE_SERVICE, account)
+    return account, data
+
+def write_active_credentials(account, data):
+    return keychain_write(ACTIVE_SERVICE, account, data)
+
+
+# ── Index (profile list) ──────────────────────────────────────────────────────
+
+def load_index():
+    if not os.path.exists(INDEX_FILE):
+        return {}
+    with open(INDEX_FILE) as f:
+        return json.load(f)
+
+def save_index(index):
+    with open(INDEX_FILE, "w") as f:
+        json.dump(index, f, indent=2)
+
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+def cmd_list():
+    index = load_index()
+    if not index:
+        print("No saved profiles yet.")
+        print("  ccswitch save <name>  →  save current account")
+        return
+
+    _, active_creds = read_active_credentials()
+    active_profile = None
+    if active_creds:
+        active_token = active_creds.get("claudeAiOauth", {}).get("accessToken", "")
+        for name, meta in index.items():
+            profile_creds = keychain_read(PROFILES_SERVICE, name)
+            if profile_creds:
+                profile_token = profile_creds.get("claudeAiOauth", {}).get("accessToken", "")
+                if profile_token == active_token:
+                    active_profile = name
+                    break
+
+    print(f"\n{'PROFILE':<18} {'ACCOUNT':<30} {'TYPE':<10} {'SAVED'}")
+    print("─" * 72)
+    for name, meta in index.items():
+        marker = " ◀ active" if name == active_profile else ""
+        profile_creds = keychain_read(PROFILES_SERVICE, name)
+        sub_type = "?"
+        if profile_creds:
+            sub_type = profile_creds.get("claudeAiOauth", {}).get("subscriptionType", "?")
+        print(f"  {name:<16} {meta.get('email','?'):<30} {sub_type:<10} {meta.get('saved_at','?')}{marker}")
+    print()
+
+def cmd_save(name):
+    if not name:
+        print("Error: profile name required.  ccswitch save <name>")
+        sys.exit(1)
+
+    account, creds = read_active_credentials()
+    if not creds:
+        print("Error: no active credentials found. Run 'claude auth login' first.")
+        sys.exit(1)
+
+    oauth = creds.get("claudeAiOauth", {})
+    sub_type = oauth.get("subscriptionType", "?")
+    expires_ms = oauth.get("expiresAt", 0)
+    expires_dt = datetime.fromtimestamp(expires_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    if not keychain_write(PROFILES_SERVICE, name, creds):
+        print("Error: could not write to Keychain.")
+        sys.exit(1)
+
+    index = load_index()
+    index[name] = {
+        "email": account,
+        "subscription": sub_type,
+        "expires_at": expires_dt,
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    save_index(index)
+    print(f"✓ saved as '{name}' ({account}, {sub_type})")
+
+def cmd_use(name):
+    if not name:
+        print("Error: profile name required.  ccswitch use <name>")
+        sys.exit(1)
+
+    index = load_index()
+    if name not in index:
+        print(f"Error: profile '{name}' not found.")
+        print(f"Saved profiles: {', '.join(index.keys()) or 'none'}")
+        sys.exit(1)
+
+    creds = keychain_read(PROFILES_SERVICE, name)
+    if not creds:
+        print(f"Error: credentials for '{name}' not found in Keychain.")
+        sys.exit(1)
+
+    email = index[name].get("email", name)
+    if not write_active_credentials(email, creds):
+        print("Error: could not update active credentials.")
+        sys.exit(1)
+
+    print(f"✓ switched to '{name}' ({email})")
+
+def cmd_add(name):
+    if not name:
+        print("Error: profile name required.  ccswitch add <name>")
+        sys.exit(1)
+
+    print(f"Adding new account as '{name}'...")
+    old_account, old_creds = read_active_credentials()
+
+    print("Opening browser, please log in...")
+    print("(return to this terminal when done)\n")
+
+    result = subprocess.run(["claude", "auth", "login"], text=True)
+
+    if result.returncode != 0:
+        print("Error: auth login failed.")
+        if old_creds and old_account:
+            write_active_credentials(old_account, old_creds)
+        sys.exit(1)
+
+    new_account, new_creds = read_active_credentials()
+    if not new_creds:
+        print("Error: could not read new credentials.")
+        if old_creds and old_account:
+            write_active_credentials(old_account, old_creds)
+        sys.exit(1)
+
+    if not keychain_write(PROFILES_SERVICE, name, new_creds):
+        print("Error: could not write to Keychain.")
+        sys.exit(1)
+
+    oauth = new_creds.get("claudeAiOauth", {})
+    sub_type = oauth.get("subscriptionType", "?")
+    expires_ms = oauth.get("expiresAt", 0)
+    expires_dt = datetime.fromtimestamp(expires_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    index = load_index()
+    index[name] = {
+        "email": new_account,
+        "subscription": sub_type,
+        "expires_at": expires_dt,
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    save_index(index)
+    print(f"\n✓ '{name}' ({new_account}, {sub_type}) added and active")
+
+    if old_creds and old_account and old_account != new_account:
+        print(f"\nPrevious account ({old_account}) is now inactive.")
+        answer = input("Save it too? (enter a name or press Enter to skip): ").strip()
+        if answer:
+            if not keychain_write(PROFILES_SERVICE, answer, old_creds):
+                print("Error: could not save previous account.")
+            else:
+                old_oauth = old_creds.get("claudeAiOauth", {})
+                index[answer] = {
+                    "email": old_account,
+                    "subscription": old_oauth.get("subscriptionType", "?"),
+                    "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                }
+                save_index(index)
+                print(f"✓ '{answer}' ({old_account}) saved")
+
+def cmd_remove(name):
+    if not name:
+        print("Error: profile name required.  ccswitch remove <name>")
+        sys.exit(1)
+
+    index = load_index()
+    if name not in index:
+        print(f"Error: profile '{name}' not found.")
+        sys.exit(1)
+
+    keychain_delete(PROFILES_SERVICE, name)
+    del index[name]
+    save_index(index)
+    print(f"✓ profile '{name}' removed")
+
+def cmd_current():
+    account, creds = read_active_credentials()
+    if not creds:
+        print("No active account found.")
+        return
+
+    oauth = creds.get("claudeAiOauth", {})
+    sub_type = oauth.get("subscriptionType", "?")
+    tier = oauth.get("rateLimitTier", "?")
+    expires_ms = oauth.get("expiresAt", 0)
+    expires_dt = datetime.fromtimestamp(expires_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    index = load_index()
+    active_token = oauth.get("accessToken", "")
+    matched_profile = None
+    for pname, _ in index.items():
+        pcreds = keychain_read(PROFILES_SERVICE, pname)
+        if pcreds and pcreds.get("claudeAiOauth", {}).get("accessToken", "") == active_token:
+            matched_profile = pname
+            break
+
+    print(f"\n  Account : {account}")
+    print(f"  Profile : {matched_profile or '(unsaved)'}")
+    print(f"  Plan    : {sub_type} ({tier})")
+    print(f"  Expires : {expires_dt}")
+    print()
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+COMMANDS = {
+    "list": (cmd_list, 0),
+    "save": (cmd_save, 1),
+    "use": (cmd_use, 1),
+    "add": (cmd_add, 1),
+    "remove": (cmd_remove, 1),
+    "current": (cmd_current, 0),
+}
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        sys.exit(0)
+
+    cmd = args[0]
+    if cmd not in COMMANDS:
+        print(f"Unknown command: '{cmd}'")
+        print(f"Commands: {', '.join(COMMANDS)}")
+        sys.exit(1)
+
+    fn, nargs = COMMANDS[cmd]
+    arg = args[1] if len(args) > 1 else None
+    fn(arg) if nargs else fn()
+
+if __name__ == "__main__":
+    main()
