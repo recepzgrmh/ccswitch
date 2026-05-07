@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "ccswitch Usage Helper",
+  "version": "1.0.0",
+  "description": "Shows Claude rate-limit usage in ccswitch. Makes requests via Chrome session — never exposes cookies.",
+  "minimum_chrome_version": "105",
+  "permissions": ["nativeMessaging"],
+  "host_permissions": ["https://claude.ai/*"],
+  "background": {
+    "service_worker": "service_worker.js"
+  }
+}

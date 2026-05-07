@@ -2,43 +2,124 @@
 """
 ccswitch - Claude Code account switcher
 Usage:
-  ccswitch list              List saved profiles
-  ccswitch save <name>       Save active account as a named profile
-  ccswitch use <name>        Switch to a saved profile instantly
-  ccswitch add <name>        Add a new account (opens browser login)
-  ccswitch remove <name>     Remove a saved profile
-  ccswitch status            Show active account and all profiles
-  ccswitch current           Alias for status
+  ccswitch list                          List saved profiles
+  ccswitch save <name>                   Save active account as a named profile
+  ccswitch use <name>                    Switch to a saved profile instantly
+  ccswitch add <name>                    Add a new account (opens browser login)
+  ccswitch remove <name>                 Remove a saved profile
+  ccswitch status                        Show active account and all profiles
+  ccswitch helper install <ext-id>       Install Chrome usage helper
+  ccswitch helper uninstall              Remove Chrome usage helper
+  ccswitch doctor                        Check tool health
 """
 
 import sys
 import json
+import socket as _socket
 import subprocess
 import os
 import re
 import base64
-import sqlite3
-import tempfile
-import time
-import urllib.request
-import urllib.error
-import urllib.parse
-import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
 ACTIVE_SERVICE   = "Claude Code-credentials"
 PROFILES_SERVICE = "ccswitch-profiles"
-SESSION_SERVICE  = "ccswitch-session"
 INDEX_FILE       = os.path.expanduser("~/.claude/ccswitch-index.json")
-VERSION          = "1.4.0"
-CHROME_ROOT      = Path.home() / "Library/Application Support/Google/Chrome"
+VERSION          = "1.5.0"
+
+HELPER_SOCK      = Path.home() / ".claude" / "ccswitch-helper.sock"
+HELPER_DIR       = Path.home() / ".local" / "share" / "ccswitch"
+NATIVE_HOST_NAME = "com.recepzgrmh.ccswitch"
+NATIVE_HOSTS_DIR = (
+    Path.home() / "Library" / "Application Support"
+    / "Google" / "Chrome" / "NativeMessagingHosts"
+)
+
+# Bridge script written to disk on `ccswitch helper install`
+_BRIDGE_SCRIPT = r'''#!/usr/bin/env python3
+"""ccswitch Chrome Usage Bridge — native messaging host."""
+import json, os, socket, struct, sys, threading, uuid
+from pathlib import Path
+
+SOCK_PATH = Path.home() / ".claude" / "ccswitch-helper.sock"
+_lock = threading.Lock()
+_pending = {}
+
+def _nm_read():
+    raw = sys.stdin.buffer.read(4)
+    if len(raw) < 4: return None
+    length = struct.unpack("=I", raw)[0]
+    data = sys.stdin.buffer.read(length)
+    return json.loads(data.decode()) if len(data) == length else None
+
+def _nm_write(obj):
+    data = json.dumps(obj, separators=(",", ":")).encode()
+    sys.stdout.buffer.write(struct.pack("=I", len(data)) + data)
+    sys.stdout.buffer.flush()
+
+def _nm_reader():
+    while True:
+        msg = _nm_read()
+        if msg is None: os._exit(0)
+        req_id = msg.get("id")
+        if not req_id: continue
+        with _lock:
+            item = _pending.get(req_id)
+            if item:
+                item["response"] = msg
+                item["event"].set()
+
+def _ask_extension(org_id):
+    req_id = str(uuid.uuid4())
+    event  = threading.Event()
+    with _lock:
+        _pending[req_id] = {"event": event, "response": None}
+    _nm_write({"id": req_id, "type": "get_usage", "org_id": org_id})
+    timed_out = not event.wait(timeout=8)
+    with _lock:
+        item = _pending.pop(req_id, {})
+    if timed_out:
+        return {"ok": False, "error": "timeout_waiting_for_extension"}
+    return item.get("response") or {"ok": False, "error": "empty_response"}
+
+def _handle_client(conn):
+    try:
+        chunks = []
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk: break
+            chunks.append(chunk)
+        req    = json.loads(b"".join(chunks).decode())
+        result = _ask_extension(req.get("org_id", ""))
+        conn.sendall(json.dumps(result).encode())
+    except Exception as exc:
+        try: conn.sendall(json.dumps({"ok": False, "error": str(exc)}).encode())
+        except Exception: pass
+    finally:
+        conn.close()
+
+def _serve():
+    SOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try: SOCK_PATH.unlink()
+    except FileNotFoundError: pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(SOCK_PATH))
+    os.chmod(str(SOCK_PATH), 0o600)
+    srv.listen(8)
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=_handle_client, args=(conn,), daemon=True).start()
+
+if __name__ == "__main__":
+    threading.Thread(target=_nm_reader, daemon=True).start()
+    _serve()
+'''
 
 
 # ── JWT helpers ───────────────────────────────────────────────────────────────
 
 def decode_jwt_email(token):
-    """Decode JWT payload and extract email/sub without verifying signature."""
     try:
         payload = token.split('.')[1]
         payload += '=' * (4 - len(payload) % 4)
@@ -75,11 +156,10 @@ def keychain_write(service, account, data):
     return result.returncode == 0
 
 def keychain_delete(service, account):
-    result = subprocess.run(
+    subprocess.run(
         ["security", "delete-generic-password", "-s", service, "-a", account],
         capture_output=True
     )
-    return result.returncode == 0
 
 def get_active_account():
     result = subprocess.run(
@@ -93,8 +173,7 @@ def read_active_credentials():
     account = get_active_account()
     if not account:
         return None, None
-    data = keychain_read(ACTIVE_SERVICE, account)
-    return account, data
+    return account, keychain_read(ACTIVE_SERVICE, account)
 
 def write_active_credentials(account, data):
     return keychain_write(ACTIVE_SERVICE, account, data)
@@ -113,237 +192,42 @@ def save_index(index):
         json.dump(index, f, indent=2)
 
 
-# ── Chrome session key extraction ─────────────────────────────────────────────
+# ── Usage via Chrome helper extension ────────────────────────────────────────
 
-def _chrome_safe_storage_password():
-    result = subprocess.run(
-        ["security", "find-generic-password", "-w", "-a", "Chrome", "-s", "Chrome Safe Storage"],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        raise RuntimeError("Chrome Safe Storage not found in Keychain")
-    return result.stdout.strip().encode()
-
-def _derive_chrome_key(password_bytes):
-    return hashlib.pbkdf2_hmac("sha1", password_bytes, b"saltysalt", 1003, dklen=16)
-
-def _openssl_decrypt_aes128cbc(ciphertext, key):
-    iv = b" " * 16
-    result = subprocess.run(
-        ["openssl", "enc", "-d", "-aes-128-cbc",
-         "-K", key.hex(), "-iv", iv.hex(), "-nopad"],
-        input=ciphertext, capture_output=True
-    )
-    if result.returncode != 0:
-        raise RuntimeError("openssl decrypt failed")
-    return result.stdout
-
-def _strip_pkcs_padding(data):
-    if not data:
-        raise RuntimeError("empty decrypted data")
-    pad = data[-1]
-    if pad < 1 or pad > 16:
-        raise RuntimeError(f"invalid padding: {pad}")
-    return data[:-pad]
-
-def _decrypt_chrome_cookie(host_key, value, encrypted_value, db_version, chrome_key):
-    if value:
-        return value
-    enc = bytes(encrypted_value or b"")
-    if not enc:
-        return ""
-    if not enc.startswith(b"v10"):
-        raise RuntimeError("unsupported Chrome cookie format")
-    enc = enc[3:]
-    plain = _openssl_decrypt_aes128cbc(enc, chrome_key)
-    plain = _strip_pkcs_padding(plain)
-    # DB version 24+ prepends SHA256(host_key) before the actual value
-    if db_version >= 24:
-        prefix = hashlib.sha256(host_key.encode()).digest()
-        if plain.startswith(prefix):
-            plain = plain[32:]
-    return plain.decode("utf-8", "replace")
-
-def _chrome_profile_dirs():
-    if not CHROME_ROOT.exists():
-        return []
-    candidates = []
-    local_state = CHROME_ROOT / "Local State"
-    if local_state.exists():
-        try:
-            data = json.loads(local_state.read_text())
-            profile = data.get("profile", {})
-            last_used = profile.get("last_used")
-            if last_used:
-                candidates.append(CHROME_ROOT / last_used)
-            for name in profile.get("info_cache", {}).keys():
-                candidates.append(CHROME_ROOT / name)
-        except Exception:
-            pass
-    for name in ("Default", "Profile 1", "Profile 2", "Profile 3"):
-        candidates.append(CHROME_ROOT / name)
-    seen, out = set(), []
-    for p in candidates:
-        if p.exists() and p not in seen:
-            seen.add(p)
-            out.append(p)
-    return out
-
-def _copy_sqlite_live(source_path):
-    tmp = tempfile.NamedTemporaryFile(prefix="ccswitch-", suffix=".sqlite", delete=False)
-    tmp_path = Path(tmp.name)
-    tmp.close()
-    src = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
-    dst = sqlite3.connect(str(tmp_path))
+def _fetch_usage_via_extension(org_id="", timeout=5):
+    """Send usage request to the Chrome helper bridge socket. Returns dict or None."""
+    if not HELPER_SOCK.exists():
+        return None
     try:
-        src.backup(dst)
-    finally:
-        dst.close()
-        src.close()
-    return tmp_path
-
-def _read_cookies_from_db(db_path):
-    """Extract sessionKey and lastActiveOrg for claude.ai from a Chrome cookie DB."""
-    tmp_path = _copy_sqlite_live(db_path)
-    result = {"sessionKey": None, "orgId": None}
-    try:
-        con = sqlite3.connect(str(tmp_path))
-        con.row_factory = sqlite3.Row
-        cur = con.cursor()
-        try:
-            row = cur.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()
-            db_version = int(row["value"]) if row else 0
-        except Exception:
-            db_version = 0
-
-        rows = cur.execute(
-            """
-            SELECT host_key, name, value, encrypted_value
-            FROM cookies
-            WHERE host_key LIKE '%claude.ai'
-              AND name IN ('sessionKey', 'lastActiveOrg')
-            ORDER BY last_access_utc DESC
-            """
-        ).fetchall()
-
-        chrome_key = None
-        for r in rows:
-            name = r["name"]
-            if name == "lastActiveOrg":
-                val = r["value"] or ""
-                if not val and r["encrypted_value"]:
-                    try:
-                        if chrome_key is None:
-                            chrome_key = _derive_chrome_key(_chrome_safe_storage_password())
-                        val = _decrypt_chrome_cookie(r["host_key"], r["value"], r["encrypted_value"], db_version, chrome_key)
-                    except Exception:
-                        pass
-                if val and not result["orgId"]:
-                    result["orgId"] = val
-            elif name == "sessionKey":
-                try:
-                    if chrome_key is None:
-                        chrome_key = _derive_chrome_key(_chrome_safe_storage_password())
-                    val = _decrypt_chrome_cookie(r["host_key"], r["value"], r["encrypted_value"], db_version, chrome_key)
-                    if val.startswith("sk-ant-sid") and not result["sessionKey"]:
-                        result["sessionKey"] = val
-                except Exception:
-                    pass
-        con.close()
-    finally:
-        try:
-            tmp_path.unlink()
-        except Exception:
-            pass
-    return result
-
-def find_chrome_session_data():
-    """Find Claude sessionKey + orgId from Chrome. Raises RuntimeError if not found."""
-    if not CHROME_ROOT.exists():
-        raise RuntimeError("Chrome not found on this machine")
-    for profile_dir in _chrome_profile_dirs():
-        for db_path in [profile_dir / "Network" / "Cookies", profile_dir / "Cookies"]:
-            if not db_path.exists():
-                continue
-            try:
-                data = _read_cookies_from_db(db_path)
-                if data["sessionKey"]:
-                    return data
-            except Exception:
-                continue
-    raise RuntimeError(
-        "Claude session not found in Chrome — open https://claude.ai in Chrome, log in, then try again"
-    )
-
-
-# ── Session storage ───────────────────────────────────────────────────────────
-
-def save_session_data(profile_name, session_data):
-    payload = {
-        "sessionKey": session_data.get("sessionKey"),
-        "orgId":      session_data.get("orgId"),
-        "updated_at": datetime.now(tz=timezone.utc).isoformat(),
-    }
-    keychain_write(SESSION_SERVICE, profile_name, payload)
-
-def load_session_data(profile_name):
-    return keychain_read(SESSION_SERVICE, profile_name)
-
-
-# ── Usage API ─────────────────────────────────────────────────────────────────
-
-def _claude_request(path, session_key):
-    req = urllib.request.Request(
-        f"https://claude.ai{path}",
-        headers={
-            "Accept": "application/json",
-            "Cookie": f"sessionKey={session_key}",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "anthropic-client-platform": "web_claude_ai",
-            "anthropic-client-version": "1.0.0",
-        }
-    )
-    with urllib.request.urlopen(req, timeout=8) as r:
-        return json.loads(r.read().decode())
-
-def _fetch_org_id(session_key):
-    try:
-        data = _claude_request("/api/account", session_key)
-        memberships = data.get("memberships", [])
-        if memberships:
-            org_id = memberships[0].get("organization", {}).get("id")
-            if org_id:
-                return org_id
-        return data.get("organization_id") or data.get("org_id")
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(str(HELPER_SOCK))
+            s.sendall(json.dumps({"type": "get_usage", "org_id": org_id}).encode())
+            s.shutdown(_socket.SHUT_WR)
+            chunks = []
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        return json.loads(b"".join(chunks).decode())
     except Exception:
         return None
-
-def fetch_usage(org_id, session_key):
-    path = f"/api/organizations/{urllib.parse.quote(org_id)}/usage"
-    try:
-        return _claude_request(path, session_key)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")
-        if e.code in (401, 403) or "account_session_invalid" in body:
-            raise RuntimeError("session expired — open Claude in Chrome, then run: ccswitch save <name>")
-        raise RuntimeError(f"API error {e.code}")
-    except Exception as e:
-        raise RuntimeError(str(e))
 
 
 # ── Usage display ─────────────────────────────────────────────────────────────
 
 def _human_until(dt_str):
     try:
-        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        dt   = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
         secs = int((dt - datetime.now(tz=timezone.utc)).total_seconds())
         if secs <= 0:
             return "resetting..."
         d, r = divmod(secs, 86400)
         h, r = divmod(r, 3600)
         m, _ = divmod(r, 60)
-        if d:  return f"{d}d {h}h"
-        if h:  return f"{h}h {m}m"
+        if d: return f"{d}d {h}h"
+        if h: return f"{h}h {m}m"
         return f"{m}m"
     except Exception:
         return "?"
@@ -353,77 +237,25 @@ def _bar(util, width=10):
     return "█" * filled + "░" * (width - filled)
 
 def print_usage_for_profile(profile_name):
-    session = load_session_data(profile_name)
-    if not session:
+    index  = load_index()
+    org_id = index.get(profile_name, {}).get("org_id", "")
+    result = _fetch_usage_via_extension(org_id)
+    if not result or not result.get("ok"):
         return
-    session_key = session.get("sessionKey")
-    if not session_key:
-        return
-    org_id = session.get("orgId")
-    if not org_id:
-        org_id = _fetch_org_id(session_key)
-        if org_id:
-            session["orgId"] = org_id
-            save_session_data(profile_name, session)
-    if not org_id:
-        print("  usage    : unavailable (could not resolve org ID)")
-        return
-    try:
-        usage   = fetch_usage(org_id, session_key)
-        five_h  = usage.get("five_hour")
-        seven_d = usage.get("seven_day")
-        if five_h:
-            u = int(five_h.get("utilization", 0))
-            print(f"  5h limit : {_bar(u)}  {u:>3}%  resets in {_human_until(five_h.get('resets_at',''))}")
-        if seven_d:
-            u = int(seven_d.get("utilization", 0))
-            print(f"  7d limit : {_bar(u)}  {u:>3}%  resets in {_human_until(seven_d.get('resets_at',''))}")
-    except RuntimeError:
-        pass  # silently skip usage if session unavailable
-
-
-# ── Session capture ───────────────────────────────────────────────────────────
-
-def _validate_session_key(session_key):
-    """Return True if session_key is accepted by the claude.ai API."""
-    try:
-        _claude_request("/api/account", session_key)
-        return True
-    except Exception:
-        return False
-
-def capture_session(profile_name, open_browser=False):
-    """Try to capture Chrome session. If open_browser=True, prompts user to log in to claude.ai."""
-    if not CHROME_ROOT.exists():
-        return
-
-    if open_browser:
-        try:
-            subprocess.Popen(["open", "-a", "Google Chrome", "https://claude.ai"])
-        except Exception:
-            pass
-        print()
-        print("  For usage tracking, log into claude.ai in the Chrome tab that just opened.")
-        try:
-            input("  Press Enter once you're logged in (or Ctrl+C to skip)... ")
-        except (KeyboardInterrupt, EOFError):
-            print()
-            return
-
-    try:
-        data = find_chrome_session_data()
-        sk = data.get("sessionKey", "")
-        if sk and _validate_session_key(sk):
-            save_session_data(profile_name, data)
-            org_note = f", org {data['orgId'][:8]}..." if data.get("orgId") else ""
-            print(f"  ✓ browser session captured from Chrome{org_note}")
-        elif sk:
-            # Save even if invalid — user can retry with ccswitch save
-            save_session_data(profile_name, data)
-            if open_browser:
-                print(f"  ! session still invalid. Try: open claude.ai in Chrome, log in, then run 'ccswitch save {profile_name}'")
-    except RuntimeError:
-        pass
+    # Cache org_id returned by extension for faster future calls
+    returned_org_id = result.get("org_id")
+    if returned_org_id and not org_id and profile_name in index:
+        index[profile_name]["org_id"] = returned_org_id
+        save_index(index)
+    usage   = result.get("usage", {})
+    five_h  = usage.get("five_hour")
+    seven_d = usage.get("seven_day")
+    if five_h:
+        u = int(five_h.get("utilization", 0))
+        print(f"  5h limit : {_bar(u)}  {u:>3}%  resets in {_human_until(five_h.get('resets_at', ''))}")
+    if seven_d:
+        u = int(seven_d.get("utilization", 0))
+        print(f"  7d limit : {_bar(u)}  {u:>3}%  resets in {_human_until(seven_d.get('resets_at', ''))}")
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -436,25 +268,22 @@ def cmd_list():
         return
 
     _, active_creds = read_active_credentials()
-    active_profile = None
+    active_profile  = None
     if active_creds:
         active_token = active_creds.get("claudeAiOauth", {}).get("accessToken", "")
-        for name, meta in index.items():
-            profile_creds = keychain_read(PROFILES_SERVICE, name)
-            if profile_creds:
-                if profile_creds.get("claudeAiOauth", {}).get("accessToken", "") == active_token:
-                    active_profile = name
-                    break
+        for pname in index:
+            pcreds = keychain_read(PROFILES_SERVICE, pname)
+            if pcreds and pcreds.get("claudeAiOauth", {}).get("accessToken", "") == active_token:
+                active_profile = pname
+                break
 
     print(f"\n{'PROFILE':<18} {'ACCOUNT':<30} {'TYPE':<10} {'SAVED'}")
     print("─" * 72)
     for name, meta in index.items():
         marker = " ◀ active" if name == active_profile else ""
-        profile_creds = keychain_read(PROFILES_SERVICE, name)
-        sub_type = "?"
-        if profile_creds:
-            sub_type = profile_creds.get("claudeAiOauth", {}).get("subscriptionType", "?")
-        print(f"  {name:<16} {meta.get('email','?'):<30} {sub_type:<10} {meta.get('saved_at','?')}{marker}")
+        pcreds = keychain_read(PROFILES_SERVICE, name)
+        sub    = pcreds.get("claudeAiOauth", {}).get("subscriptionType", "?") if pcreds else "?"
+        print(f"  {name:<16} {meta.get('email','?'):<30} {sub:<10} {meta.get('saved_at','?')}{marker}")
     print()
 
 def cmd_save(name):
@@ -478,6 +307,7 @@ def cmd_save(name):
 
     display_email = decode_jwt_email(oauth.get("accessToken", "")) or account
     index = load_index()
+    existing_org_id = index.get(name, {}).get("org_id", "")
     index[name] = {
         "email":            display_email,
         "keychain_account": account,
@@ -485,9 +315,10 @@ def cmd_save(name):
         "expires_at":       expires_dt,
         "saved_at":         datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
+    if existing_org_id:
+        index[name]["org_id"] = existing_org_id
     save_index(index)
     print(f"✓ saved as '{name}' ({display_email}, {sub_type})")
-    capture_session(name)
 
 def cmd_use(name):
     if not name:
@@ -505,13 +336,12 @@ def cmd_use(name):
         print(f"Error: credentials for '{name}' not found in Keychain.")
         sys.exit(1)
 
-    email            = index[name].get("email", name)
-    keychain_account = index[name].get("keychain_account") or email
+    keychain_account = index[name].get("keychain_account") or index[name].get("email", name)
     if not write_active_credentials(keychain_account, creds):
         print("Error: could not update active credentials.")
         sys.exit(1)
 
-    print(f"✓ switched to '{name}' ({email})")
+    print(f"✓ switched to '{name}' ({index[name].get('email', name)})")
     print_usage_for_profile(name)
 
 def cmd_add(name):
@@ -534,7 +364,6 @@ def cmd_add(name):
     print("(return to this terminal when done)\n")
 
     result = subprocess.run(["claude", "auth", "login"], text=True)
-
     if result.returncode != 0:
         print("Error: auth login failed.")
         if old_creds and old_account:
@@ -542,7 +371,6 @@ def cmd_add(name):
         sys.exit(1)
 
     new_account, new_creds = read_active_credentials()
-
     if not new_creds:
         print("Error: could not read credentials after login.")
         if old_creds and old_account:
@@ -552,15 +380,14 @@ def cmd_add(name):
     new_token = new_creds.get("claudeAiOauth", {}).get("accessToken", "")
     if new_token == old_token:
         print("Error: login was cancelled or the same account was used.")
-        print("  No new credentials detected. Profile not saved.")
         sys.exit(1)
 
     new_display_email = decode_jwt_email(new_token) or new_account
-    existing_profile  = None
-    for pname, meta in index.items():
-        if meta.get("email") == new_display_email and pname != name:
-            existing_profile = pname
-            break
+    existing_profile  = next(
+        (pname for pname, meta in index.items()
+         if meta.get("email") == new_display_email and pname != name),
+        None
+    )
     if existing_profile:
         print(f"Warning: this account ({new_display_email}) is already saved as '{existing_profile}'.")
         answer = input("Save it again under a new name? [y/N]: ").strip().lower()
@@ -588,7 +415,6 @@ def cmd_add(name):
     }
     save_index(index)
     print(f"\n✓ '{name}' ({new_display_email}, {sub_type}) added and active")
-    capture_session(name, open_browser=True)
 
     if old_creds and old_account and old_account != new_account:
         old_display_email = decode_jwt_email(old_token) or old_account
@@ -597,9 +423,7 @@ def cmd_add(name):
             print(f"\nPrevious account ({old_display_email}) is now inactive.")
             answer = input("Save it too? (enter a name or press Enter to skip): ").strip()
             if answer:
-                if not keychain_write(PROFILES_SERVICE, answer, old_creds):
-                    print("Error: could not save previous account.")
-                else:
+                if keychain_write(PROFILES_SERVICE, answer, old_creds):
                     old_oauth = old_creds.get("claudeAiOauth", {})
                     index[answer] = {
                         "email":            old_display_email,
@@ -621,14 +445,12 @@ def cmd_remove(name):
         sys.exit(1)
 
     keychain_delete(PROFILES_SERVICE, name)
-    keychain_delete(SESSION_SERVICE, name)
     del index[name]
     save_index(index)
     print(f"✓ profile '{name}' removed")
 
 def cmd_status():
     account, creds = read_active_credentials()
-
     if not creds:
         print("\n  No active Claude Code session found.")
         print("  Run 'claude auth login' to authenticate.\n")
@@ -645,7 +467,7 @@ def cmd_status():
     index        = load_index()
     active_token = oauth.get("accessToken", "")
     matched_profile = None
-    for pname, _ in index.items():
+    for pname in index:
         pcreds = keychain_read(PROFILES_SERVICE, pname)
         if pcreds and pcreds.get("claudeAiOauth", {}).get("accessToken", "") == active_token:
             matched_profile = pname
@@ -673,10 +495,8 @@ def cmd_status():
     print("  ── Saved profiles ──────────────────────────────")
     for name, meta in index.items():
         marker = " ◀" if name == matched_profile else "  "
-        profile_creds = keychain_read(PROFILES_SERVICE, name)
-        sub = "?"
-        if profile_creds:
-            sub = profile_creds.get("claudeAiOauth", {}).get("subscriptionType", "?")
+        pcreds = keychain_read(PROFILES_SERVICE, name)
+        sub    = pcreds.get("claudeAiOauth", {}).get("subscriptionType", "?") if pcreds else "?"
         print(f" {marker} {name:<16} {meta.get('email','?'):<28} {sub}")
 
     print()
@@ -685,17 +505,135 @@ def cmd_status():
         print()
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── ccswitch helper ───────────────────────────────────────────────────────────
 
-COMMANDS = {
-    "list":    (cmd_list,   0),
-    "save":    (cmd_save,   1),
-    "use":     (cmd_use,    1),
-    "add":     (cmd_add,    1),
-    "remove":  (cmd_remove, 1),
-    "status":  (cmd_status, 0),
-    "current": (cmd_status, 0),
-}
+def cmd_helper(args):
+    sub = args[0] if args else "status"
+    if sub == "install":
+        _helper_install(args[1] if len(args) > 1 else None)
+    elif sub == "uninstall":
+        _helper_uninstall()
+    elif sub == "status":
+        _helper_status()
+    else:
+        print(f"Unknown helper subcommand: '{sub}'")
+        print("Usage: ccswitch helper [install <extension-id> | uninstall | status]")
+        sys.exit(1)
+
+def _helper_install(ext_id):
+    if not ext_id:
+        print("Error: extension ID required.\n")
+        print("  ccswitch helper install <extension-id>\n")
+        print("Steps to get the extension ID:")
+        print("  1. Chrome → chrome://extensions → enable Developer mode")
+        print("  2. Load unpacked → select the chrome-helper/ folder from the ccswitch repo")
+        print("     (or download from: https://github.com/recepzgrmh/ccswitch)")
+        print("  3. Copy the 32-character ID shown under the extension name")
+        sys.exit(1)
+
+    # Write bridge script
+    HELPER_DIR.mkdir(parents=True, exist_ok=True)
+    bridge_path = HELPER_DIR / "ccswitch_chrome_bridge.py"
+    bridge_path.write_text(_BRIDGE_SCRIPT)
+    os.chmod(str(bridge_path), 0o755)
+    print(f"✓ bridge  →  {bridge_path}")
+
+    # Write native host manifest
+    NATIVE_HOSTS_DIR.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "name":            NATIVE_HOST_NAME,
+        "description":     "ccswitch Chrome usage bridge",
+        "path":            str(bridge_path),
+        "type":            "stdio",
+        "allowed_origins": [f"chrome-extension://{ext_id}/"],
+    }
+    manifest_path = NATIVE_HOSTS_DIR / f"{NATIVE_HOST_NAME}.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    print(f"✓ manifest →  {manifest_path}")
+    print()
+    print("✓ Chrome helper installed!")
+    print()
+    print("Make sure the extension is loaded in Chrome:")
+    print("  chrome://extensions → Developer mode → Load unpacked → chrome-helper/")
+    print()
+    print("Verify everything works: ccswitch doctor")
+
+def _helper_uninstall():
+    removed = []
+    manifest_path = NATIVE_HOSTS_DIR / f"{NATIVE_HOST_NAME}.json"
+    if manifest_path.exists():
+        manifest_path.unlink()
+        removed.append(str(manifest_path))
+    bridge_path = HELPER_DIR / "ccswitch_chrome_bridge.py"
+    if bridge_path.exists():
+        bridge_path.unlink()
+        removed.append(str(bridge_path))
+    if removed:
+        for r in removed:
+            print(f"✓ removed  {r}")
+        print("\nChrome extension must be removed manually: chrome://extensions")
+    else:
+        print("Nothing to remove.")
+
+def _helper_status():
+    manifest_path = NATIVE_HOSTS_DIR / f"{NATIVE_HOST_NAME}.json"
+    bridge_path   = HELPER_DIR / "ccswitch_chrome_bridge.py"
+    sock_ok       = HELPER_SOCK.exists()
+
+    print()
+    print("  ── Chrome usage helper ─────────────────────────")
+    print(f"  manifest : {'✓ installed' if manifest_path.exists() else '✗ not installed'}")
+    print(f"  bridge   : {'✓ installed' if bridge_path.exists() else '✗ not installed'}")
+    print(f"  socket   : {'✓ running' if sock_ok else '✗ not running  (open Chrome with the extension loaded)'}")
+    print()
+    if not manifest_path.exists():
+        print("  To install:  ccswitch helper install <extension-id>")
+        print()
+
+
+# ── ccswitch doctor ───────────────────────────────────────────────────────────
+
+def cmd_doctor():
+    print()
+    print("  ── ccswitch doctor ─────────────────────────────")
+
+    # claude CLI
+    r = subprocess.run(["which", "claude"], capture_output=True, text=True)
+    print(f"  claude CLI : {'✓ ' + r.stdout.strip() if r.returncode == 0 else '✗ not found'}")
+
+    # active session
+    account, creds = read_active_credentials()
+    print(f"  session    : {'✓ ' + (decode_jwt_email(creds.get('claudeAiOauth',{}).get('accessToken','')) or account or '?') if creds else '✗ not logged in'}")
+
+    # index
+    index = load_index()
+    print(f"  profiles   : {len(index)} saved")
+
+    # helper
+    manifest_path = NATIVE_HOSTS_DIR / f"{NATIVE_HOST_NAME}.json"
+    bridge_path   = HELPER_DIR / "ccswitch_chrome_bridge.py"
+    sock_exists   = HELPER_SOCK.exists()
+
+    print(f"  manifest   : {'✓' if manifest_path.exists() else '✗ run: ccswitch helper install <ext-id>'}")
+    print(f"  bridge     : {'✓' if bridge_path.exists() else '✗'}")
+    print(f"  socket     : {'✓ bridge is running' if sock_exists else '✗ open Chrome with ccswitch extension'}")
+
+    if sock_exists:
+        test = _fetch_usage_via_extension(timeout=3)
+        if test and test.get("ok"):
+            u5  = test.get("usage", {}).get("five_hour", {}).get("utilization", "?")
+            u7  = test.get("usage", {}).get("seven_day", {}).get("utilization", "?")
+            print(f"  usage API  : ✓ 5h={u5}%  7d={u7}%")
+        else:
+            err = (test or {}).get("error", "no response")
+            print(f"  usage API  : ✗ {err}")
+            if "not_logged_into_claude_ai" in err:
+                print("               → open https://claude.ai in Chrome and log in")
+
+    print()
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     args = sys.argv[1:]
@@ -708,15 +646,21 @@ def main():
         print(f"ccswitch {VERSION}")
         sys.exit(0)
 
-    cmd = args[0]
-    if cmd not in COMMANDS:
-        print(f"Unknown command: '{cmd}'")
-        print(f"Commands: {', '.join(COMMANDS)}")
-        sys.exit(1)
+    cmd  = args[0]
+    rest = args[1:]
 
-    fn, nargs = COMMANDS[cmd]
-    arg = args[1] if len(args) > 1 else None
-    fn(arg) if nargs else fn()
+    if   cmd == "list":                cmd_list()
+    elif cmd == "save":                cmd_save(rest[0] if rest else None)
+    elif cmd == "use":                 cmd_use(rest[0] if rest else None)
+    elif cmd == "add":                 cmd_add(rest[0] if rest else None)
+    elif cmd == "remove":              cmd_remove(rest[0] if rest else None)
+    elif cmd in ("status", "current"): cmd_status()
+    elif cmd == "helper":              cmd_helper(rest)
+    elif cmd == "doctor":              cmd_doctor()
+    else:
+        print(f"Unknown command: '{cmd}'")
+        print("Commands: list, save, use, add, remove, status, helper, doctor")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
