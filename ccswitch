@@ -399,7 +399,7 @@ def _bar(util, width=10):
 
 def print_usage_for_profile(profile_name):
     index  = load_index()
-    org_id = index.get(profile_name, {}).get("org_id", "")
+    org_id = str(index.get(profile_name, {}).get("org_id", "") or "")
     result = _fetch_usage(org_id)
     if not result or not result.get("ok"):
         return
