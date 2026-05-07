@@ -9,131 +9,37 @@ Usage:
   ccswitch remove <name>       Remove a saved profile
   ccswitch status              Show active account and all profiles
   ccswitch doctor              Check tool health
-
-Usage display requires Chrome with claude.ai open and logged in.
 """
 
 import sys
 import json
-import socket as _socket
 import subprocess
 import os
 import re
 import base64
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 ACTIVE_SERVICE   = "Claude Code-credentials"
 PROFILES_SERVICE = "ccswitch-profiles"
 INDEX_FILE       = os.path.expanduser("~/.claude/ccswitch-index.json")
-VERSION          = "1.6.1"
+VERSION          = "1.7.0"
 WELCOME_FLAG     = Path.home() / ".claude" / "ccswitch-welcomed"
-
-HELPER_SOCK      = Path.home() / ".claude" / "ccswitch-helper.sock"
-HELPER_DIR       = Path.home() / ".local" / "share" / "ccswitch"
-NATIVE_HOST_NAME = "com.recepzgrmh.ccswitch"
-NATIVE_HOSTS_DIR = (
-    Path.home() / "Library" / "Application Support"
-    / "Google" / "Chrome" / "NativeMessagingHosts"
-)
-
-# Bridge script written to disk on `ccswitch helper install`
-_BRIDGE_SCRIPT = r'''#!/usr/bin/env python3
-"""ccswitch Chrome Usage Bridge — native messaging host."""
-import json, os, socket, struct, sys, threading, uuid
-from pathlib import Path
-
-SOCK_PATH = Path.home() / ".claude" / "ccswitch-helper.sock"
-_lock = threading.Lock()
-_pending = {}
-
-def _nm_read():
-    raw = sys.stdin.buffer.read(4)
-    if len(raw) < 4: return None
-    length = struct.unpack("=I", raw)[0]
-    data = sys.stdin.buffer.read(length)
-    return json.loads(data.decode()) if len(data) == length else None
-
-def _nm_write(obj):
-    data = json.dumps(obj, separators=(",", ":")).encode()
-    sys.stdout.buffer.write(struct.pack("=I", len(data)) + data)
-    sys.stdout.buffer.flush()
-
-def _nm_reader():
-    while True:
-        msg = _nm_read()
-        if msg is None: os._exit(0)
-        req_id = msg.get("id")
-        if not req_id: continue
-        with _lock:
-            item = _pending.get(req_id)
-            if item:
-                item["response"] = msg
-                item["event"].set()
-
-def _ask_extension(org_id):
-    req_id = str(uuid.uuid4())
-    event  = threading.Event()
-    with _lock:
-        _pending[req_id] = {"event": event, "response": None}
-    _nm_write({"id": req_id, "type": "get_usage", "org_id": org_id})
-    timed_out = not event.wait(timeout=8)
-    with _lock:
-        item = _pending.pop(req_id, {})
-    if timed_out:
-        return {"ok": False, "error": "timeout_waiting_for_extension"}
-    return item.get("response") or {"ok": False, "error": "empty_response"}
-
-def _handle_client(conn):
-    try:
-        chunks = []
-        while True:
-            chunk = conn.recv(4096)
-            if not chunk: break
-            chunks.append(chunk)
-        req    = json.loads(b"".join(chunks).decode())
-        result = _ask_extension(req.get("org_id", ""))
-        conn.sendall(json.dumps(result).encode())
-    except Exception as exc:
-        try: conn.sendall(json.dumps({"ok": False, "error": str(exc)}).encode())
-        except Exception: pass
-    finally:
-        conn.close()
-
-def _serve():
-    SOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    try: SOCK_PATH.unlink()
-    except FileNotFoundError: pass
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(str(SOCK_PATH))
-    os.chmod(str(SOCK_PATH), 0o600)
-    srv.listen(8)
-    while True:
-        conn, _ = srv.accept()
-        threading.Thread(target=_handle_client, args=(conn,), daemon=True).start()
-
-if __name__ == "__main__":
-    threading.Thread(target=_nm_reader, daemon=True).start()
-    _serve()
-'''
 
 
 # ── Banner ───────────────────────────────────────────────────────────────────
 
 def _banner():
-    """Print welcome banner. Big on first run, small one-liner after that.
-    Silenced by: CCSWITCH_BANNER=0, NO_COLOR, CI, or non-TTY stdout."""
     if (os.environ.get("CCSWITCH_BANNER") == "0"
             or os.environ.get("NO_COLOR")
             or os.environ.get("CI")
             or not sys.stdout.isatty()):
         return
 
-    OR = "\x1b[38;5;209m"   # orange
-    DM = "\x1b[2m"           # dim
-    BD = "\x1b[1m"           # bold
-    RS = "\x1b[0m"           # reset
+    OR = "\x1b[38;5;209m"
+    DM = "\x1b[2m"
+    BD = "\x1b[1m"
+    RS = "\x1b[0m"
 
     if not WELCOME_FLAG.exists():
         art = [
@@ -234,191 +140,6 @@ def save_index(index):
         json.dump(index, f, indent=2)
 
 
-# ── Usage via AppleScript (runs fetch() inside Chrome's claude.ai tab) ───────
-
-def _fetch_usage_via_applescript(org_id="", timeout=12):
-    """Execute fetch() in Chrome's open claude.ai tab. No extension needed. Returns dict or None."""
-    # Require Chrome to be running
-    r = subprocess.run(["pgrep", "-x", "Google Chrome"], capture_output=True)
-    if r.returncode != 0:
-        return None
-
-    # Build JS that fetches usage; discovers org_id first if not supplied
-    if org_id:
-        js_fetch = (
-            "(function(){"
-            "fetch('https://claude.ai/api/organizations/" + org_id + "/usage',"
-            "{credentials:'include',headers:{'Accept':'application/json'}})"
-            ".then(function(r){return r.json()})"
-            ".then(function(d){window.__ccswitch__=JSON.stringify({ok:true,usage:d,org_id:'" + org_id + "'})})"
-            ".catch(function(e){window.__ccswitch__=JSON.stringify({ok:false,error:String(e.message)})});"
-            "return 'started';})()"
-        )
-    else:
-        js_fetch = (
-            "(function(){"
-            "fetch('https://claude.ai/api/account',"
-            "{credentials:'include',headers:{'Accept':'application/json'}})"
-            ".then(function(r){return r.json()})"
-            ".then(function(d){"
-            "var oid=d&&d.memberships&&d.memberships[0]&&d.memberships[0].organization&&d.memberships[0].organization.id;"
-            "if(!oid){window.__ccswitch__=JSON.stringify({ok:false,error:'no_org_id'});return;}"
-            "return fetch('https://claude.ai/api/organizations/'+oid+'/usage',"
-            "{credentials:'include',headers:{'Accept':'application/json'}})"
-            ".then(function(r){return r.json()})"
-            ".then(function(u){window.__ccswitch__=JSON.stringify({ok:true,usage:u,org_id:oid});});})"
-            ".catch(function(e){window.__ccswitch__=JSON.stringify({ok:false,error:String(e.message)})});"
-            "return 'started';})()"
-        )
-
-    js_read  = "typeof window.__ccswitch__!='undefined'?window.__ccswitch__:'__pending__'"
-    js_clear = "delete window.__ccswitch__; 'ok'"
-
-    def run_js(js):
-        js_escaped = js.replace("\\", "\\\\").replace('"', '\\"')
-        script = (
-            'tell application "Google Chrome"\n'
-            '  set t to missing value\n'
-            '  repeat with w in every window\n'
-            '    repeat with tt in every tab of w\n'
-            '      if URL of tt starts with "https://claude.ai" then\n'
-            '        set t to tt\n'
-            '        exit repeat\n'
-            '      end if\n'
-            '    end repeat\n'
-            '    if t is not missing value then exit repeat\n'
-            '  end repeat\n'
-            '  if t is missing value then return "__no_tab__"\n'
-            '  return execute t javascript "' + js_escaped + '"\n'
-            'end tell'
-        )
-        return subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=timeout
-        )
-
-    # Inject the fetch call
-    r = run_js(js_fetch)
-    if r.returncode != 0:
-        if "Apple Events" in r.stderr or "AppleScript" in r.stderr:
-            return {"ok": False, "error": "js_apple_events_disabled"}
-        return None
-    if "__no_tab__" in r.stdout:
-        return None
-
-    # Poll for result (up to ~6 seconds)
-    deadline = time.time() + 6
-    val = "__pending__"
-    while time.time() < deadline:
-        time.sleep(0.7)
-        r = run_js(js_read)
-        if r.returncode != 0:
-            return None
-        val = r.stdout.strip()
-        if val and val != "__pending__":
-            break
-
-    run_js(js_clear)
-
-    if not val or val == "__pending__":
-        return None
-    try:
-        return json.loads(val)
-    except Exception:
-        return None
-
-
-def _fetch_usage_via_extension(org_id="", timeout=5):
-    """Try the optional Chrome helper socket (fast path if extension is installed)."""
-    if not HELPER_SOCK.exists():
-        return None
-    try:
-        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
-            s.settimeout(timeout)
-            s.connect(str(HELPER_SOCK))
-            s.sendall(json.dumps({"type": "get_usage", "org_id": org_id}).encode())
-            s.shutdown(_socket.SHUT_WR)
-            chunks = []
-            while True:
-                chunk = s.recv(4096)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-        return json.loads(b"".join(chunks).decode())
-    except Exception:
-        return None
-
-
-def _fetch_usage(org_id=""):
-    """Fetch Claude usage. Tries extension socket first (if installed), then AppleScript."""
-    result = _fetch_usage_via_extension(org_id)
-    if result and result.get("ok"):
-        return result
-    result = _fetch_usage_via_applescript(org_id)
-    if result and result.get("error") == "js_apple_events_disabled":
-        if not sys.stdout.isatty():
-            return result
-        try:
-            ans = input("\n  Enable usage display in Chrome? [y/N] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return result
-        if ans == "y":
-            subprocess.run(["open", "-a", "Google Chrome"], capture_output=True)
-            print()
-            print("  In Chrome menu bar:")
-            print("  View → Developer → Allow JavaScript from Apple Events")
-            print()
-            input("  Press Enter after enabling it… ")
-            result = _fetch_usage_via_applescript(org_id)
-        else:
-            print()
-    return result
-
-
-# ── Usage display ─────────────────────────────────────────────────────────────
-
-def _human_until(dt_str):
-    try:
-        dt   = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-        secs = int((dt - datetime.now(tz=timezone.utc)).total_seconds())
-        if secs <= 0:
-            return "resetting..."
-        d, r = divmod(secs, 86400)
-        h, r = divmod(r, 3600)
-        m, _ = divmod(r, 60)
-        if d: return f"{d}d {h}h"
-        if h: return f"{h}h {m}m"
-        return f"{m}m"
-    except Exception:
-        return "?"
-
-def _bar(util, width=10):
-    filled = round(max(0, min(100, int(util))) / 100 * width)
-    return "█" * filled + "░" * (width - filled)
-
-def print_usage_for_profile(profile_name):
-    index  = load_index()
-    org_id = str(index.get(profile_name, {}).get("org_id", "") or "")
-    result = _fetch_usage(org_id)
-    if not result or not result.get("ok"):
-        return
-    # Cache org_id for faster future calls
-    returned_org_id = result.get("org_id")
-    if returned_org_id and not org_id and profile_name in index:
-        index[profile_name]["org_id"] = returned_org_id
-        save_index(index)
-    usage   = result.get("usage", {})
-    five_h  = usage.get("five_hour")
-    seven_d = usage.get("seven_day")
-    if five_h:
-        u = int(five_h.get("utilization", 0))
-        print(f"  5h limit : {_bar(u)}  {u:>3}%  resets in {_human_until(five_h.get('resets_at', ''))}")
-    if seven_d:
-        u = int(seven_d.get("utilization", 0))
-        print(f"  7d limit : {_bar(u)}  {u:>3}%  resets in {_human_until(seven_d.get('resets_at', ''))}")
-
-
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 def cmd_list():
@@ -468,7 +189,6 @@ def cmd_save(name):
 
     display_email = decode_jwt_email(oauth.get("accessToken", "")) or account
     index = load_index()
-    existing_org_id = index.get(name, {}).get("org_id", "")
     index[name] = {
         "email":            display_email,
         "keychain_account": account,
@@ -476,8 +196,6 @@ def cmd_save(name):
         "expires_at":       expires_dt,
         "saved_at":         datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
-    if existing_org_id:
-        index[name]["org_id"] = existing_org_id
     save_index(index)
     print(f"✓ saved as '{name}' ({display_email}, {sub_type})")
 
@@ -503,7 +221,6 @@ def cmd_use(name):
         sys.exit(1)
 
     print(f"✓ switched to '{name}' ({index[name].get('email', name)})")
-    print_usage_for_profile(name)
 
 def cmd_add(name):
     if not name:
@@ -643,8 +360,6 @@ def cmd_status():
     print(f"  Profile  : {matched_profile or '(not saved)'}")
     print(f"  Plan     : {sub_type} ({tier})")
     print(f"  Expires  : {expiry_label}")
-    if matched_profile:
-        print_usage_for_profile(matched_profile)
 
     if not index:
         print()
@@ -665,157 +380,27 @@ def cmd_status():
         print("  Tip: run 'ccswitch save <name>' to save the current session.")
         print()
 
-
-# ── ccswitch helper ───────────────────────────────────────────────────────────
-
-def cmd_helper(args):
-    sub = args[0] if args else "status"
-    if sub == "install":
-        _helper_install(args[1] if len(args) > 1 else None)
-    elif sub == "uninstall":
-        _helper_uninstall()
-    elif sub == "status":
-        _helper_status()
-    else:
-        print(f"Unknown helper subcommand: '{sub}'")
-        print("Usage: ccswitch helper [install <extension-id> | uninstall | status]")
-        sys.exit(1)
-
-def _helper_install(ext_id):
-    if not ext_id:
-        print("Error: extension ID required.\n")
-        print("  ccswitch helper install <extension-id>\n")
-        print("Steps to get the extension ID:")
-        print("  1. Chrome → chrome://extensions → enable Developer mode")
-        print("  2. Load unpacked → select the chrome-helper/ folder from the ccswitch repo")
-        print("     (or download from: https://github.com/recepzgrmh/ccswitch)")
-        print("  3. Copy the 32-character ID shown under the extension name")
-        sys.exit(1)
-
-    # Write bridge script
-    HELPER_DIR.mkdir(parents=True, exist_ok=True)
-    bridge_path = HELPER_DIR / "ccswitch_chrome_bridge.py"
-    bridge_path.write_text(_BRIDGE_SCRIPT)
-    os.chmod(str(bridge_path), 0o755)
-    print(f"✓ bridge  →  {bridge_path}")
-
-    # Write native host manifest
-    NATIVE_HOSTS_DIR.mkdir(parents=True, exist_ok=True)
-    manifest = {
-        "name":            NATIVE_HOST_NAME,
-        "description":     "ccswitch Chrome usage bridge",
-        "path":            str(bridge_path),
-        "type":            "stdio",
-        "allowed_origins": [f"chrome-extension://{ext_id}/"],
-    }
-    manifest_path = NATIVE_HOSTS_DIR / f"{NATIVE_HOST_NAME}.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2))
-    print(f"✓ manifest →  {manifest_path}")
-    print()
-    print("✓ Chrome helper installed!")
-    print()
-    print("Make sure the extension is loaded in Chrome:")
-    print("  chrome://extensions → Developer mode → Load unpacked → chrome-helper/")
-    print()
-    print("Verify everything works: ccswitch doctor")
-
-def _helper_uninstall():
-    removed = []
-    manifest_path = NATIVE_HOSTS_DIR / f"{NATIVE_HOST_NAME}.json"
-    if manifest_path.exists():
-        manifest_path.unlink()
-        removed.append(str(manifest_path))
-    bridge_path = HELPER_DIR / "ccswitch_chrome_bridge.py"
-    if bridge_path.exists():
-        bridge_path.unlink()
-        removed.append(str(bridge_path))
-    if removed:
-        for r in removed:
-            print(f"✓ removed  {r}")
-        print("\nChrome extension must be removed manually: chrome://extensions")
-    else:
-        print("Nothing to remove.")
-
-def _helper_status():
-    manifest_path = NATIVE_HOSTS_DIR / f"{NATIVE_HOST_NAME}.json"
-    bridge_path   = HELPER_DIR / "ccswitch_chrome_bridge.py"
-    sock_ok       = HELPER_SOCK.exists()
-
-    print()
-    print("  ── Chrome usage helper ─────────────────────────")
-    print(f"  manifest : {'✓ installed' if manifest_path.exists() else '✗ not installed'}")
-    print(f"  bridge   : {'✓ installed' if bridge_path.exists() else '✗ not installed'}")
-    print(f"  socket   : {'✓ running' if sock_ok else '✗ not running  (open Chrome with the extension loaded)'}")
-    print()
-    if not manifest_path.exists():
-        print("  To install:  ccswitch helper install <extension-id>")
-        print()
-
-
-# ── ccswitch doctor ───────────────────────────────────────────────────────────
-
 def cmd_doctor():
     print()
     print("  ── ccswitch doctor ─────────────────────────────")
 
-    # claude CLI
     r = subprocess.run(["which", "claude"], capture_output=True, text=True)
     print(f"  claude CLI : {'✓ ' + r.stdout.strip() if r.returncode == 0 else '✗ not found'}")
 
-    # active session
     account, creds = read_active_credentials()
     print(f"  session    : {'✓ ' + (decode_jwt_email(creds.get('claudeAiOauth',{}).get('accessToken','')) or account or '?') if creds else '✗ not logged in'}")
 
-    # index
     index = load_index()
     print(f"  profiles   : {len(index)} saved")
 
-    # Chrome running?
-    r_chrome = subprocess.run(["pgrep", "-x", "Google Chrome"], capture_output=True)
-    chrome_ok = r_chrome.returncode == 0
-    print(f"  Chrome     : {'✓ running' if chrome_ok else '✗ not running  (open Chrome for usage display)'}")
-
-    # claude.ai tab open?
-    if chrome_ok:
-        script = (
-            'tell application "Google Chrome"\n'
-            '  set t to missing value\n'
-            '  repeat with w in every window\n'
-            '    repeat with tt in every tab of w\n'
-            '      if URL of tt starts with "https://claude.ai" then\n'
-            '        set t to tt\n'
-            '        exit repeat\n'
-            '      end if\n'
-            '    end repeat\n'
-            '    if t is not missing value then exit repeat\n'
-            '  end repeat\n'
-            '  if t is missing value then return "__no_tab__"\n'
-            '  return "ok"\n'
-            'end tell'
-        )
-        r_tab = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=6)
-        tab_ok = r_tab.returncode == 0 and "__no_tab__" not in r_tab.stdout
-        print(f"  claude.ai  : {'✓ tab open' if tab_ok else '✗ no tab  (open https://claude.ai in Chrome)'}")
-
-        if tab_ok:
-            print("  usage API  : checking…", end="", flush=True)
-            test = _fetch_usage_via_applescript(timeout=12)
-            if test and test.get("ok"):
-                u5  = test.get("usage", {}).get("five_hour", {}).get("utilization", "?")
-                u7  = test.get("usage", {}).get("seven_day", {}).get("utilization", "?")
-                print(f"\r  usage API  : ✓ 5h={u5}%  7d={u7}%   ")
-            elif (test or {}).get("error") == "js_apple_events_disabled":
-                print(f"\r  usage API  : ✗ Chrome → View → Developer → Allow JavaScript from Apple Events")
-            else:
-                err = (test or {}).get("error", "no response")
-                print(f"\r  usage API  : ✗ {err}")
-                if "not_logged_into" in err or test is None:
-                    print("               → make sure you're logged into claude.ai in Chrome")
-
-    # Optional extension socket
-    sock_ok = HELPER_SOCK.exists()
-    if sock_ok:
-        print(f"  ext socket : ✓ running (optional fast path)")
+    broken = []
+    for name in index:
+        if not keychain_read(PROFILES_SERVICE, name):
+            broken.append(name)
+    if broken:
+        print(f"  keychain   : ✗ missing credentials for: {', '.join(broken)}")
+    else:
+        print(f"  keychain   : ✓ all profiles intact")
 
     print()
 
@@ -845,11 +430,10 @@ def main():
     elif cmd == "add":                 cmd_add(rest[0] if rest else None)
     elif cmd == "remove":              cmd_remove(rest[0] if rest else None)
     elif cmd in ("status", "current"): cmd_status()
-    elif cmd == "helper":              cmd_helper(rest)
     elif cmd == "doctor":              cmd_doctor()
     else:
         print(f"Unknown command: '{cmd}'")
-        print("Commands: list, save, use, add, remove, status, helper, doctor")
+        print("Commands: list, save, use, add, remove, status, doctor")
         sys.exit(1)
 
 if __name__ == "__main__":
