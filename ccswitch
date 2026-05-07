@@ -23,7 +23,7 @@ from pathlib import Path
 ACTIVE_SERVICE   = "Claude Code-credentials"
 PROFILES_SERVICE = "ccswitch-profiles"
 INDEX_FILE       = os.path.expanduser("~/.claude/ccswitch-index.json")
-VERSION          = "1.7.0"
+VERSION          = "1.7.1"
 WELCOME_FLAG     = Path.home() / ".claude" / "ccswitch-welcomed"
 
 
@@ -41,28 +41,27 @@ def _banner():
     BD = "\x1b[1m"
     RS = "\x1b[0m"
 
+    art = [
+        "██████╗ ██████╗ ███████╗██╗    ██╗██╗████████╗ ██████╗██╗  ██╗",
+        "██╔════╝██╔════╝██╔════╝██║    ██║██║╚══██╔══╝██╔════╝██║  ██║",
+        "██║     ██║     ███████╗██║ █╗ ██║██║   ██║   ██║     ███████║",
+        "██║     ██║     ╚════██║██║███╗██║██║   ██║   ██║     ██╔══██║",
+        "╚██████╗╚██████╗███████║╚███╔███╔╝██║   ██║   ╚██████╗██║  ██║",
+        " ╚═════╝ ╚═════╝╚══════╝ ╚══╝╚══╝ ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝",
+    ]
+    print()
+    for line in art:
+        print(f"  {OR}{BD}{line}{RS}")
+    print(f"\n  {DM}Claude Code account switcher · by recepzgrmh{RS}")
     if not WELCOME_FLAG.exists():
-        art = [
-            "██████╗ ██████╗ ███████╗██╗    ██╗██╗████████╗ ██████╗██╗  ██╗",
-            "██╔════╝██╔════╝██╔════╝██║    ██║██║╚══██╔══╝██╔════╝██║  ██║",
-            "██║     ██║     ███████╗██║ █╗ ██║██║   ██║   ██║     ███████║",
-            "██║     ██║     ╚════██║██║███╗██║██║   ██║   ██║     ██╔══██║",
-            "╚██████╗╚██████╗███████║╚███╔███╔╝██║   ██║   ╚██████╗██║  ██║",
-            " ╚═════╝ ╚═════╝╚══════╝ ╚══╝╚══╝ ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝",
-        ]
-        print()
-        for line in art:
-            print(f"  {OR}{BD}{line}{RS}")
-        print(f"\n  {DM}Claude Code account switcher · by recepzgrmh{RS}")
         print(f"\n  {DM}If ccswitch saves you some logins, a star means a lot:{RS}")
-        print(f"  {DM}→ https://github.com/recepzgrmh/ccswitch{RS}\n")
+        print(f"  {DM}→ https://github.com/recepzgrmh/ccswitch{RS}")
         try:
             WELCOME_FLAG.parent.mkdir(parents=True, exist_ok=True)
             WELCOME_FLAG.touch()
         except Exception:
             pass
-    else:
-        print(f"  {DM}ccswitch {VERSION}{RS}")
+    print()
 
 
 # ── JWT helpers ───────────────────────────────────────────────────────────────
