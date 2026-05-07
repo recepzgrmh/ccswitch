@@ -31,19 +31,28 @@ Your tokens never leave your machine. Everything goes through the macOS Keychain
 
 ## Installation
 
+### Homebrew (recommended)
+
+```bash
+brew tap recepzgrmh/ccswitch
+brew install ccswitch
+```
+
+### One-liner
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/recepzgrmh/ccswitch/main/install.sh | bash
+```
+
+### Manual
+
 ```bash
 git clone https://github.com/recepzgrmh/ccswitch.git
 cd ccswitch
 bash install.sh
 ```
 
-Or one-liner:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/recepzgrmh/ccswitch/main/install.sh | bash
-```
-
-> **Manual install:** Copy the `ccswitch` file to any directory in your `$PATH` and run `chmod +x ccswitch`.
+> Add `~/.local/bin` to your `$PATH` if prompted.
 
 ---
 
@@ -87,12 +96,18 @@ ccswitch list
 ### Show active account
 
 ```bash
-ccswitch current
+ccswitch status
 
-  Account : work@company.com
-  Profile : work
-  Plan    : pro (default_claude_ai)
-  Expires : 2026-06-15 12:00 UTC
+  ── Active session ──────────────────────────────
+  Account  : work@company.com
+  Profile  : work
+  Plan     : pro (default_claude_ai)
+  Expires  : 2026-06-15 12:00 UTC
+
+  ── Saved profiles ──────────────────────────────
+   ◀ work             work@company.com             pro
+     main             you@example.com              pro
+     backup           backup@gmail.com             free
 ```
 
 ### Remove a profile
@@ -116,16 +131,31 @@ ccswitch add backup    # opens browser for third account
 ccswitch use work
 
 # Check where you are
-ccswitch current
+ccswitch status
 ```
 
 ---
 
 ## Security
 
-- Credentials are stored in **macOS Keychain** under the service name `ccswitch-profiles/<profile-name>`.
+- Credentials are stored in **macOS Keychain** under the service name `ccswitch-profiles`.
 - The tool only calls the standard `security` CLI — no network requests, no third-party libraries.
 - Tokens are never written to disk in plaintext.
+
+---
+
+## Uninstall
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/recepzgrmh/ccswitch/main/uninstall.sh | bash
+```
+
+Or if installed via Homebrew:
+
+```bash
+brew uninstall ccswitch
+brew untap recepzgrmh/ccswitch
+```
 
 ---
 
@@ -142,6 +172,12 @@ Not yet — Linux doesn't have Keychain. A `libsecret` / `pass` backend is a pot
 
 **Is this official / supported by Anthropic?**  
 No. This is an unofficial community tool that interacts with Claude Code's local credential storage.
+
+---
+
+## Troubleshooting
+
+See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for common issues.
 
 ---
 
