@@ -27,7 +27,7 @@ from pathlib import Path
 ACTIVE_SERVICE   = "Claude Code-credentials"
 PROFILES_SERVICE = "ccswitch-profiles"
 INDEX_FILE       = os.path.expanduser("~/.claude/ccswitch-index.json")
-VERSION          = "1.6.0"
+VERSION          = "1.6.1"
 WELCOME_FLAG     = Path.home() / ".claude" / "ccswitch-welcomed"
 
 HELPER_SOCK      = Path.home() / ".claude" / "ccswitch-helper.sock"
