@@ -3,6 +3,7 @@ set -e
 
 INSTALL_DIR="$HOME/.local/bin"
 SCRIPT_NAME="ccswitch"
+REPO_RAW="https://raw.githubusercontent.com/recepzgrmh/ccswitch/main"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -26,9 +27,16 @@ if ! command -v claude &>/dev/null; then
 fi
 
 mkdir -p "$INSTALL_DIR"
-cp "$SCRIPT_NAME" "$INSTALL_DIR/$SCRIPT_NAME"
-chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
 
+# curl pipe mode: ccswitch file won't exist in current dir, download it
+if [[ ! -f "$SCRIPT_NAME" ]]; then
+  echo "Downloading ccswitch..."
+  curl -fsSL "$REPO_RAW/ccswitch" -o "$INSTALL_DIR/$SCRIPT_NAME"
+else
+  cp "$SCRIPT_NAME" "$INSTALL_DIR/$SCRIPT_NAME"
+fi
+
+chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
 echo -e "${GREEN}✓ ccswitch installed to $INSTALL_DIR/ccswitch${NC}"
 
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
