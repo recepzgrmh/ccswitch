@@ -19,6 +19,7 @@ import re
 import base64
 import sqlite3
 import tempfile
+import time
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -30,7 +31,7 @@ ACTIVE_SERVICE   = "Claude Code-credentials"
 PROFILES_SERVICE = "ccswitch-profiles"
 SESSION_SERVICE  = "ccswitch-session"
 INDEX_FILE       = os.path.expanduser("~/.claude/ccswitch-index.json")
-VERSION          = "1.3.0"
+VERSION          = "1.4.0"
 CHROME_ROOT      = Path.home() / "Library/Application Support/Google/Chrome"
 
 
@@ -377,21 +378,50 @@ def print_usage_for_profile(profile_name):
         if seven_d:
             u = int(seven_d.get("utilization", 0))
             print(f"  7d limit : {_bar(u)}  {u:>3}%  resets in {_human_until(seven_d.get('resets_at',''))}")
-    except RuntimeError as e:
-        print(f"  usage    : {e}")
+    except RuntimeError:
+        pass  # silently skip usage if session unavailable
 
 
 # ── Session capture ───────────────────────────────────────────────────────────
 
-def capture_session(profile_name):
-    """Try to capture Chrome session after login. Non-fatal if it fails."""
+def _validate_session_key(session_key):
+    """Return True if session_key is accepted by the claude.ai API."""
     try:
-        data = find_chrome_session_data()
-        save_session_data(profile_name, data)
-        org_note = f", org {data['orgId'][:8]}..." if data.get("orgId") else ""
-        print(f"  ✓ browser session captured from Chrome{org_note}")
-    except RuntimeError as e:
-        print(f"  ! usage unavailable: {e}")
+        _claude_request("/api/account", session_key)
+        return True
+    except Exception:
+        return False
+
+def capture_session(profile_name, open_browser=False):
+    """Try to capture Chrome session. If open_browser=True, opens claude.ai first to refresh cookies."""
+    if open_browser and CHROME_ROOT.exists():
+        try:
+            print("  Opening claude.ai in Chrome to refresh session...")
+            subprocess.Popen(["open", "-a", "Google Chrome", "https://claude.ai"])
+            time.sleep(5)
+        except Exception:
+            pass
+
+    for attempt in range(2):
+        try:
+            data = find_chrome_session_data()
+            sk = data.get("sessionKey", "")
+            if sk and _validate_session_key(sk):
+                save_session_data(profile_name, data)
+                org_note = f", org {data['orgId'][:8]}..." if data.get("orgId") else ""
+                print(f"  ✓ browser session captured from Chrome{org_note}")
+                return
+            elif attempt == 0 and open_browser:
+                # Session invalid on first try — wait a bit more and retry once
+                time.sleep(4)
+                continue
+            else:
+                # Save anyway so capture_session --refresh can retry later
+                if sk:
+                    save_session_data(profile_name, data)
+                return
+        except RuntimeError:
+            return
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -556,7 +586,7 @@ def cmd_add(name):
     }
     save_index(index)
     print(f"\n✓ '{name}' ({new_display_email}, {sub_type}) added and active")
-    capture_session(name)
+    capture_session(name, open_browser=True)
 
     if old_creds and old_account and old_account != new_account:
         old_display_email = decode_jwt_email(old_token) or old_account
